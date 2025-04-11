@@ -1,1 +1,1 @@
-# DTI_2D_representation
+# An Interpretable Representation Learning Approach for Diffusion Tensor Imaging
