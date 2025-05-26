@@ -271,7 +271,7 @@ def simclr_loss(z_i, z_j, temperature=0.5, reduction="mean"):
     return loss
 
 def vae_simclr_loss(x1, x2, x1_recon, x2_recon, z1, z2, 
-                    mu1, logvar1, mu2, logvar2,
+                    mu1, logvar1, mu2, logvar2, fm_feats1=None, fm_feats2=None,
                     recon_type="mse", reduction="sum",
                     simclr_temperature=0.5, 
                     vae_weight=1.0, simclr_weight=1.0, beta=10.0):
@@ -314,6 +314,9 @@ def vae_simclr_loss(x1, x2, x1_recon, x2_recon, z1, z2,
     total_kl_loss = (kl_loss1 + kl_loss2) / 2.0
     
     # Compute SimCLR loss using the latent means as representations.
+    if fm_feats1 is not None and fm_feats2 is not None:
+        mu1 = torch.cat([mu1, fm_feats1], dim=1)
+        mu2 = torch.cat([mu2, fm_feats2], dim=1)
     simclr_loss_val = simclr_loss(mu1, mu2, temperature=simclr_temperature, reduction=reduction)
     
     # Combine the two losses with their respective weights.
@@ -373,7 +376,7 @@ def batch_hard_triplet_loss(embeddings, labels, margin=1.0, reduction='mean'):
         return losses
     
 
-def autoencoder_triplet_loss(x, x_recon, y, z, mu, logvar, margin=1.0, recon_type="mse", reduction="sum", triplet_weight=1.0, vae_weight=1.0, beta=10.0):
+def autoencoder_triplet_loss(x, x_recon, y, z, mu, logvar, fm_feats=None, margin=1.0, recon_type="mse", reduction="sum", triplet_weight=1.0, vae_weight=1.0, beta=10.0):
     """
     Combines the VAE loss with the triplet loss computed on the latent means.
     
@@ -391,13 +394,17 @@ def autoencoder_triplet_loss(x, x_recon, y, z, mu, logvar, margin=1.0, recon_typ
         total_loss, total_vae_loss, recon_loss, kl_loss, triplet_loss_val
     """
     total_vae_loss, recon_loss, kl_loss = beta_tcvae_loss(x, x_recon, z, mu, logvar, beta, recon_type, reduction)
+
+    if fm_feats is not None:
+        mu = torch.cat([mu, fm_feats], dim=1)
+
     triplet_loss_val = batch_hard_triplet_loss(mu, y, margin=margin, reduction=reduction)
     total_loss = vae_weight * total_vae_loss + triplet_weight * triplet_loss_val
     return total_loss, total_vae_loss, recon_loss, kl_loss, triplet_loss_val
 
 ### AUTOENCODER + CLASSIFIER LOSS ###
 
-def autoencoder_loss(x, x_recon, y, y_pred, z, mu, logvar, class_loss_weight=1.0, vae_loss_weight=1.0, beta=10.0):
+def autoencoder_loss(x, x_recon, y, y_pred, z, mu, logvar, l1_matrix = None, class_loss_weight=1.0, vae_loss_weight=1.0, beta=10.0, l1_weight=0.01):
     '''
     Combined (weighted loss) for autoencoder and classifier
 
@@ -417,15 +424,24 @@ def autoencoder_loss(x, x_recon, y, y_pred, z, mu, logvar, class_loss_weight=1.0
 
     # VAE loss
     total_vae_loss, recon_loss, kl_loss = beta_tcvae_loss(x, x_recon, z, mu, logvar, recon_type="mse", reduction="sum", beta=beta)
+    # total_vae_loss, recon_loss, kl_loss = vae_loss(x, x_recon, mu, logvar, recon_type="mse", reduction="sum")
 
     # Classifier loss
     criterion = nn.BCEWithLogitsLoss()
     class_loss = criterion(y_pred, y)
 
-    # Combine the losses
-    total_loss = vae_loss_weight * total_vae_loss + class_loss_weight * class_loss
+    # L1 regularization on latent vector
+    if l1_matrix is not None:
+        l1_loss = torch.norm(l1_matrix, p=1, dim=1).mean()
+    else:
+        l1_loss = torch.tensor(0.0)
 
-    return total_loss, total_vae_loss, recon_loss, kl_loss, class_loss
+    # Combine the losses
+    total_loss = (vae_loss_weight * total_vae_loss + 
+                class_loss_weight * class_loss + 
+                l1_weight * l1_loss)
+
+    return total_loss, total_vae_loss, recon_loss, kl_loss, class_loss, l1_loss
 
 
 
@@ -565,149 +581,177 @@ class DTI_autoencoder(nn.Module):
 
         return x_recon, class_logits, mu, logvar
 
-### MODEL DEFINITION ###
-class DTI_autoencoder3D(nn.Module):
+class FMLayer2ndOrder(nn.Module):
+    def __init__(self, num_features: int, latent_dim: int):
+        super().__init__()
+        # no bias or linear term here; pure 2-way interactions
+        self.V = nn.Parameter(torch.randn(num_features, latent_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch_size, num_features]
+        # sum-square trick for 2nd-order interactions
+        xv = x @ self.V                       # [B, k]
+        xv_sq = xv * xv                       # [B, k]
+        x_sq = x * x                          # [B, n]
+        v_sq = self.V * self.V                # [n, k]
+        x_v_sq = x_sq @ v_sq                  # [B, k]
+        interaction = xv_sq - x_v_sq          # [B, k]
+        return interaction                    # [B, k]
+
+class Spatial_DTI_autoencoder(nn.Module):
     def __init__(self, 
                  in_channels=1, 
-                 latent_dim=32, 
-                 num_classes=10):
-        """
-        Variational Autoencoder with a classifier head using 3D convolutions.
-        Encoder: 5x5x5 -> 1x1x1 -> produces mu, logvar
-        Reparameterization: z = mu + eps * exp(0.5 * logvar)
-        Decoder: z -> recon(5x5x5)
-        Classifier: z -> class logits
-        """
-        super(DTI_autoencoder3D, self).__init__()
+                 latent_dim=16, 
+                 num_classes=10,
+                 fm_latent_dim=None):
+        super().__init__()
+        # -------------------------
+        #      Encoder
+        # -------------------------
+        self.enc_conv = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),  # 9→9
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),                                       # 9→4
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),           # 4→4
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2)                                        # 4→2
+        )
+        # μ and logvar convs (1×1), output shape: (B, latent_dim, 2, 2)
+        self.conv_mu     = nn.Conv2d(64, latent_dim,     kernel_size=1)
+        self.conv_logvar = nn.Conv2d(64, latent_dim,     kernel_size=1)
 
         # -------------------------
-        #        Encoder
+        #      Decoder (Spatial Broadcast)
         # -------------------------
-        # Block 1: From (5,5,5) to (2,2,2)
-        self.conv1 = nn.Conv3d(in_channels, 16, kernel_size=3, padding=1)
-        self.batchnorm1 = nn.BatchNorm3d(16)
-        self.relu1 = nn.ReLU()
-        self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2)  # 5 -> 2
-
-        # Block 2: From (2,2,2) to (1,1,1)
-        self.conv2 = nn.Conv3d(16, 32, kernel_size=3, padding=1)
-        self.batchnorm2 = nn.BatchNorm3d(32)
-        self.relu2 = nn.ReLU()
-        self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)  # 2 -> 1
-
-        # Block 3: Additional feature extraction (stays at 1x1x1)
-        self.conv3 = nn.Conv3d(32, 64, kernel_size=3, padding=1)
-        self.batchnorm3 = nn.BatchNorm3d(64)
-        self.relu3 = nn.ReLU()
-        # No pooling here, as the feature map is already 1x1x1
-
-        # Flatten (64, 1, 1, 1) -> 64 and map to an intermediate embedding
-        self.fc_enc = nn.Linear(64, 128)
-
-        # Separate linear layers for mu and logvar for the VAE
-        self.fc_mu = nn.Linear(128, latent_dim)
-        self.fc_logvar = nn.Linear(128, latent_dim)
-
+        self.dec_conv = nn.Sequential(
+            nn.Conv2d(latent_dim + 2, 128, kernel_size=3, padding=1),  # with XY channels
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, in_channels, kernel_size=3, padding=1)       # → (B,1,9,9)
+        )
+        
         # -------------------------
-        #        Decoder
+        #     Factorization Machine
         # -------------------------
-        # Map latent vector back to a feature volume of shape (64,1,1,1)
-        self.fc_dec = nn.Linear(latent_dim, 64)
+        if fm_latent_dim is not None:
+            self.fm_latent_dim = fm_latent_dim
+            self.fm = FMLayer2ndOrder(num_features=81, latent_dim=self.fm_latent_dim)
 
-        # Deconvolutional layers to upsample from 1x1x1 to 5x5x5:
-        # First upsample: 1 -> 2
-        self.deconv1 = nn.ConvTranspose3d(64, 32, kernel_size=2, stride=2)
-        self.relu4   = nn.ReLU()
-
-        # Second upsample: 2 -> 4
-        self.deconv2 = nn.ConvTranspose3d(32, 16, kernel_size=2, stride=2)
-        self.relu5   = nn.ReLU()
-
-        # Final upsample: 4 -> 5
-        # Using kernel_size=2, stride=1 gives: (4-1)*1 - 0 + 2 = 5
-        self.deconv3 = nn.ConvTranspose3d(16, in_channels, kernel_size=2, stride=1)
+        else:
+            self.fm = None
+            self.fm_latent_dim = None
 
         # -------------------------
         #     Classifier Head
         # -------------------------
-        self.classifier = nn.Sequential(
-            nn.Linear(latent_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(64, num_classes)  # final logits
-        )
+        if fm_latent_dim is not None:
+            self.classifier = nn.Sequential(
+                nn.Linear(latent_dim * 2 * 2 + fm_latent_dim, 64),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.5),
+                nn.Linear(64, num_classes)
+            )
+        else:
+            self.classifier = nn.Sequential(
+                nn.Linear(latent_dim * 2 * 2, 64),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.5),
+                nn.Linear(64, num_classes)
+            )
 
-    def encode(self, x):
-        """Encode input x -> (mu, logvar). x shape: (batch, in_channels, 5, 5, 5)"""
-        x = self.conv1(x)
-        x = self.batchnorm1(x)
-        x = self.relu1(x)
-        x = self.pool1(x)  # Expected shape: (batch, 16, 2, 2, 2)
-
-        x = self.conv2(x)
-        x = self.batchnorm2(x)
-        x = self.relu2(x)
-        x = self.pool2(x)  # Expected shape: (batch, 32, 1, 1, 1)
-
-        x = self.conv3(x)
-        x = self.batchnorm3(x)
-        x = self.relu3(x)  # Shape: (batch, 64, 1, 1, 1)
-
-        # Flatten: (batch, 64)
-        x = x.view(x.size(0), -1)
-        x = self.fc_enc(x)  # Shape: (batch, 128)
-        mu = self.fc_mu(x)  # Shape: (batch, latent_dim)
-        logvar = self.fc_logvar(x)  # Shape: (batch, latent_dim)
-        return mu, logvar
+    def encode(self, x, with_fm=False):
+        """x: (B,1,9,9) → mu, logvar: (B,latent,2,2)"""
+        h = self.enc_conv(x)
+        mu     = self.conv_mu(h)
+        logvar = self.conv_logvar(h)
+        
+        ## Concatenate fm with mu
+        if with_fm:
+            B = x.size(0)
+            flat = x.view(B, -1)                    # [B,81]
+            fm_feats = self.fm(flat)                # [B, k]
+            new_mu = torch.cat([mu.view(B, -1), fm_feats], dim=1)
+            return mu, logvar, new_mu
+        else:
+            return mu, logvar
 
     def reparameterize(self, mu, logvar):
-        """Reparameterization trick: z = mu + eps * exp(0.5 * logvar)."""
+        """Perform sampling per spatial location."""
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
-        z = mu + eps * std
-        return z
+        return mu + eps * std
+
+    def spatial_broadcast(self, z):
+        """
+        Upsample z: (B,C,2,2) → (B,C,9,9), 
+        build XY channels, and concat → (B,C+2,9,9).
+        """
+        B, C, _, _ = z.size()
+        # Upsample latent to full image size
+        z_upsampled = F.interpolate(z, size=(9,9), mode='nearest')  # :contentReference[oaicite:3]{index=3}
+
+        # Create normalized coordinate maps
+        xs = torch.linspace(-1, 1, 9, device=z.device)
+        ys = torch.linspace(-1, 1, 9, device=z.device)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')     # shape (9,9)
+        grid_x = grid_x.unsqueeze(0).expand(B, -1, -1).unsqueeze(1) # (B,1,9,9)
+        grid_y = grid_y.unsqueeze(0).expand(B, -1, -1).unsqueeze(1) # (B,1,9,9)
+
+        # Concatenate along channel dim
+        return torch.cat([z_upsampled, grid_x, grid_y], dim=1)
 
     def decode(self, z):
-        """Decode z -> reconstructed x with shape (batch, in_channels, 5, 5, 5)."""
-        x = self.fc_dec(z)  # Shape: (batch, 64)
-        x = x.view(x.size(0), 64, 1, 1, 1)  # Reshape to (batch, 64, 1, 1, 1)
+        """
+        z: (B,latent,2,2) → recon: (B,1,9,9)
+        """
+        sb = self.spatial_broadcast(z)
+        return self.dec_conv(sb)  # :contentReference[oaicite:4]{index=4}
 
-        x = self.deconv1(x)  # Upsample: expected shape (batch, 32, 2, 2, 2)
-        x = self.relu4(x)
-
-        x = self.deconv2(x)  # Upsample: expected shape (batch, 16, 4, 4, 4)
-        x = self.relu5(x)
-
-        x = self.deconv3(x)  # Final upsample: expected shape (batch, in_channels, 5, 5, 5)
-        # Optionally, apply a non-linearity such as sigmoid if inputs are in [0,1]
-        # x = torch.sigmoid(x)
-        return x
+    def classify(self, mu, fm_feats=None):
+        """
+        mu: (B,latent,2,2) → logits: (B,num_classes)
+        """
+        # Global average pool over spatial dims → (B,latent)
+        # pooled = mu.mean(dim=[2,3])
+        flattened = mu.view(mu.size(0), -1)
+        if fm_feats is not None:
+            flattened = torch.cat([flattened, fm_feats], dim=1)
+        return self.classifier(flattened)
 
     def forward(self, x):
-        """
-        Forward pass:
-        1) Encode -> mu, logvar
-        2) Reparameterize -> z
-        3) Decode -> x_recon
-        4) Classify -> class_logits (using mu as latent features)
-        
-        Returns:
-            x_recon (Tensor): Reconstructed input volume (batch, in_channels, 5, 5, 5)
-            class_logits (Tensor): Class logits from classifier
-            mu (Tensor): Mean of latent distribution
-            logvar (Tensor): Log-variance of latent distribution
-        """
         mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        x_recon = self.decode(z)
-        class_logits = self.classifier(mu)
+        z          = self.reparameterize(mu, logvar)
+        recon      = self.decode(z)
 
-        return x_recon, class_logits, mu, logvar
+        ## Concatenate FM features with mu
+        if self.fm_latent_dim is not None:
+            # Flatten pixels for FM
+            B = x.size(0)
+            flat = x.view(B, -1)                    # [B,81]
+            fm_feats = self.fm(flat)                # [B, k]
+        else:
+            fm_feats = None
 
+        logits = self.classify(mu, fm_feats)
 
+        ## Flatten 2x2xlatent to latent
+        mu = mu.view(mu.size(0), -1)
+        logvar = logvar.view(logvar.size(0), -1)
+        if self.fm_latent_dim is not None:
+            return recon, logits, mu, logvar, fm_feats
+        else:
+            return recon, logits, mu, logvar
+        
+    def get_interactions(self, x):
+        B = x.size(0)
+        flat = x.view(B, -1)                    # [B,81]
+        fm_feats = self.fm(flat)                # [B, k]        # Assemble full 81x81 grid if requested
+        G = self.fm.V @ self.fm.V.t()         # [81,81]
+        pixel_outer = flat.unsqueeze(2) * flat.unsqueeze(1)
+        interactions = pixel_outer * G.unsqueeze(0)  # [B,81,81]
+        return interactions
+    
 if __name__ == '__main__':
     # Test the model
     model = DTI_autoencoder(in_channels=1, latent_dim=32, num_classes=1)
