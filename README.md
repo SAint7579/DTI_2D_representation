@@ -1,6 +1,6 @@
 # DTI 2D Representation
 
-This project implements a 2D representation system for Diffusion Tensor Imaging (DTI) data, providing visualization and analysis tools for DTI datasets.
+The model learns an interpretable and disentangled representation from Diffusion Tensor Imaging.
 
 ![Architecture Overview](arch_figure.png)
 
